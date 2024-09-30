@@ -1,53 +1,20 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import transforms
+from torchvision import models, transforms
 from PIL import Image
 import cv2
+import sqlite3
+from datetime import datetime
 import numpy as np
 import os
 
-# Define the LeNet-5 Model
-class LeNet5(nn.Module):
-    def __init__(self, num_classes):
-        super(LeNet5, self).__init__()
-        
-        # Layer 1: Convolutional Layer (input channels: 3, output channels: 6, kernel size: 5x5)
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=5, stride=1, padding=2)
-        # Layer 2: Max Pooling Layer (kernel size: 2x2, stride: 2)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # Layer 3: Convolutional Layer (input channels: 6, output channels: 16, kernel size: 5x5)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=5)
-        # Layer 4: Max Pooling Layer (kernel size: 2x2, stride: 2)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # Fully connected layers
-        # Layer 5: Fully Connected Layer (input: 16*5*5, output: 120)
-        self.fc1 = nn.Linear(46656, 264)
-        # Layer 6: Fully Connected Layer (input: 120, output: 84)
-        # self.fc2 = nn.Linear(264, 64)
-        # Layer 7: Fully Connected Layer (input: 84, output: num_classes)
-        self.fc3 = nn.Linear(264, num_classes)
-
-    def forward(self, x):
-        # Pass through first conv layer followed by max pooling
-        x = self.pool1(torch.relu(self.conv1(x)))
-        # Pass through second conv layer followed by max pooling
-        x = self.pool2(torch.relu(self.conv2(x)))
-        # Flatten the feature maps to pass through fully connected layers
-        x = x.view(x.size(0), -1)  # Reshape to batch_size x (16*5*5)
-        # Pass through fully connected layers
-        x = torch.relu(self.fc1(x))
-        # x = torch.relu(self.fc2(x))
-        x = self.fc3(x)  # Output layer (no activation for the final layer since it's for classification)
-        return x
-
-# Load the model
+# Load the pre-trained ResNet18 model and modify the last layer
 def load_model(model_path, num_classes):
-    model = LeNet5(num_classes=num_classes)
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    model.eval()
+    model = models.resnet18(pretrained=True)  # Load ResNet18 pretrained on ImageNet
+    model.fc = nn.Linear(model.fc.in_features, num_classes)  # Modify the final fully connected layer
+    model.load_state_dict(torch.load(model_path))  # Load the trained weights
+    model.eval()  # Set the model to evaluation mode
     return model
 
 # Preprocess the image and crop the face
@@ -99,12 +66,38 @@ def classify_image(model, image_tensor, class_names):
 
     return predicted_class
 
+# SQLite3 database initialization
+def init_db():
+    conn = sqlite3.connect('detections.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS detections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_name TEXT,
+            datetime TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Store detection result in the SQLite3 database
+def log_detection(person_name):
+    conn = sqlite3.connect('detections.db')
+    c = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO detections (person_name, datetime) VALUES (?, ?)', (person_name, timestamp))
+    conn.commit()
+    conn.close()
+
 # Streamlit app
 def main():
-    st.title("Real-Time Person Recognition")
+    st.title("Real-Time Person Recognition with ResNet18")
+
+    # Initialize the database
+    init_db()
 
     # Sidebar: Load model and dataset information
-    model_path = "person_classifier_model.pth"  # Path to your trained model
+    model_path = "person_classifier_resnet18.pth"  # Path to your trained ResNet18 model
     class_names = os.listdir("Data/train")  # Load class names from dataset
     num_classes = len(class_names)
 
@@ -140,6 +133,8 @@ def main():
                 try:
                     face_tensor = preprocess_image(frame)  # Preprocess the captured frame
                     predicted_class = classify_image(model, face_tensor, class_names)
+                    # Log the detection into the database
+                    log_detection(predicted_class)
                     st.session_state.current_prediction = predicted_class
                 except ValueError as e:
                     st.session_state.current_prediction = str(e)  # Handle no face detected
