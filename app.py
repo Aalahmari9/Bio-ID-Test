@@ -11,16 +11,20 @@ import os
 
 # Load the pre-trained ResNet18 model and modify the last layer
 def load_model(model_path, num_classes):
-    model = models.resnet18(pretrained=True)  # Load ResNet18 pretrained on ImageNet
+    model = models.resnet18(pretrained=False)  # Load ResNet18 without pre-training
     model.fc = nn.Linear(model.fc.in_features, num_classes)  # Modify the final fully connected layer
-    model.load_state_dict(torch.load(model_path))  # Load the trained weights
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     model.eval()  # Set the model to evaluation mode
     return model
 
 # Preprocess the image and crop the face
 def preprocess_image(image, face_cascade_path='haarcascade_frontalface_default.xml'):
-    # Convert the image from BGR (OpenCV) to RGB (PIL expects RGB)
-    img_rgb = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
+    # Check if image is already a PIL image
+    if isinstance(image, Image.Image):
+        img_rgb = np.array(image)
+    else:
+        # Convert the image from BGR (OpenCV) to RGB
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # Load the Haar Cascade for face detection
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + face_cascade_path)
