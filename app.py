@@ -1,77 +1,135 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import transforms
 from PIL import Image
 import cv2
 import sqlite3
 from datetime import datetime
 import numpy as np
 import os
+from facenet_pytorch import InceptionResnetV1  
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm  
 
-# Load the pre-trained ResNet18 model and modify the last layer
-def load_model(model_path, num_classes):
-    model = models.resnet18(pretrained=False)  # Load ResNet18 without pre-training
-    model.fc = nn.Linear(model.fc.in_features, num_classes)  # Modify the final fully connected layer
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    model.eval()  # Set the model to evaluation mode
+
+USER_CREDENTIALS = {"user1": "password123", "user2": "password456"}
+
+def load_facenet_model(device):
+    model = InceptionResnetV1(pretrained='vggface2').eval()  
+    model.to(device)
     return model
 
-# Preprocess the image and crop the face
+
 def preprocess_image(image, face_cascade_path='haarcascade_frontalface_default.xml'):
-    # Check if image is already a PIL image
-    if isinstance(image, Image.Image):
-        img_rgb = np.array(image)
-    else:
-        # Convert the image from BGR (OpenCV) to RGB
-        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    # Load the Haar Cascade for face detection
+    img_rgb = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + face_cascade_path)
-
-    # Detect faces
     faces = face_cascade.detectMultiScale(img_rgb, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
     if len(faces) == 0:
         raise ValueError("No face detected in the image.")
 
-    # Crop the first detected face
     x, y, w, h = faces[0]
     face = img_rgb[y:y+h, x:x+w]
-
-    # Convert the cropped face to a PIL image
     face_pil = Image.fromarray(face)
-
-    # Define the image preprocessing steps
+    
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((160, 160)),  
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-
-    # Apply transformations to the face image
+    
     face_tensor = transform(face_pil)
-    face_tensor = face_tensor.unsqueeze(0)  # Add batch dimension (1, 3, 224, 224)
-
+    face_tensor = face_tensor.unsqueeze(0)  
     return face_tensor
 
-# Perform classification
-def classify_image(model, image_tensor, class_names):
-    # Move the tensor to the same device as the model (CPU or GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_tensor = image_tensor.to(device)
-    model = model.to(device)
 
-    # Make predictions
+def init_embedding_db():
+    conn = sqlite3.connect('embeddings.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS embeddings (
+            person_name TEXT PRIMARY KEY,
+            embedding BLOB
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def save_embedding_to_db(person_name, embedding):
+    conn = sqlite3.connect('embeddings.db')
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO embeddings (person_name, embedding) VALUES (?, ?)',
+              (person_name, embedding.tobytes()))
+    conn.commit()
+    conn.close()
+
+
+def load_embeddings_from_db():
+    conn = sqlite3.connect('embeddings.db')
+    c = conn.cursor()
+    c.execute('SELECT person_name, embedding FROM embeddings')
+    rows = c.fetchall()
+    conn.close()
+
+    known_face_embeddings = []
+    class_names = []
+
+    for row in rows:
+        person_name = row[0]
+        embedding = np.frombuffer(row[1], dtype=np.float32)
+        known_face_embeddings.append(embedding)
+        class_names.append(person_name)
+
+    known_face_embeddings = np.array(known_face_embeddings)
+    return known_face_embeddings, class_names
+
+
+def check_for_new_persons(data_path):
+    conn = sqlite3.connect('embeddings.db')
+    c = conn.cursor()
+    c.execute('SELECT person_name FROM embeddings')
+    existing_persons = set([row[0] for row in c.fetchall()])
+    data_persons = set(os.listdir(data_path))
+    new_persons = data_persons - existing_persons
+    conn.close()
+    return list(new_persons)
+
+
+def generate_and_store_new_embeddings(model, new_persons, data_path, device):
+    for person_name in tqdm(new_persons, desc="Generating embeddings for new persons"):
+        person_dir = os.path.join(data_path, person_name)
+        if os.path.isdir(person_dir):
+            for image_file in os.listdir(person_dir):
+                image_path = os.path.join(person_dir, image_file)
+                try:
+                    image = Image.open(image_path)
+                    face_tensor = preprocess_image(image)  
+                    face_tensor = face_tensor.to(device)
+                    with torch.no_grad():
+                        embedding = model(face_tensor).cpu().numpy()
+                    save_embedding_to_db(person_name, embedding)
+
+                except Exception as e:
+                    print(f"Error processing image {image_path}: {e}")
+
+
+def recognize_face(model, face_tensor, known_face_embeddings, class_names, device, threshold=0.6):
+    face_tensor = face_tensor.to(device)
     with torch.no_grad():
-        output = model(image_tensor)
-        _, predicted = torch.max(output, 1)
-        predicted_class = class_names[predicted.item()]
+        embedding = model(face_tensor).cpu().numpy()
+    similarities = cosine_similarity(embedding, known_face_embeddings)
+    best_match_idx = np.argmax(similarities)
+    best_match_score = similarities[0][best_match_idx]
 
-    return predicted_class
+    if best_match_score >= threshold:
+        return class_names[best_match_idx]  
+    else:
+        return "Unknown"  
 
-# SQLite3 database initialization
-def init_db():
+
+def init_detection_db():
     conn = sqlite3.connect('detections.db')
     c = conn.cursor()
     c.execute('''
@@ -84,7 +142,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Store detection result in the SQLite3 database
+
 def log_detection(person_name):
     conn = sqlite3.connect('detections.db')
     c = conn.cursor()
@@ -93,89 +151,76 @@ def log_detection(person_name):
     conn.commit()
     conn.close()
 
-# Streamlit app
+
+def login_page():
+    st.title("Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
+            st.session_state["username"] = username
+            st.session_state["logged_in"] = True
+            st.success("Login successful! Redirecting to face detection...")
+            st.experimental_rerun()
+        else:
+            st.error("Invalid username or password")
+
+
+def face_detection_page():
+    st.title("Face Detection")
+    FRAME_WINDOW = st.image([])  
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_facenet_model(device)
+    known_face_embeddings, class_names = load_embeddings_from_db()
+    cap = cv2.VideoCapture(0)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Failed to read from camera")
+            break
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        FRAME_WINDOW.image(frame)
+
+        try:
+            face_tensor = preprocess_image(frame)
+            recognized_person = recognize_face(model, face_tensor, known_face_embeddings, class_names, device)
+            if recognized_person == st.session_state["username"]:
+                log_detection(recognized_person)
+                st.success(f"Face recognized! Redirecting to welcome page...")
+                st.session_state["face_recognized"] = True
+                st.experimental_rerun()
+                break
+        except ValueError:
+            st.warning("No face detected")
+
+    cap.release()
+
+
+def welcome_page():
+    st.title(f"Welcome {st.session_state['username']}!")
+    
+    if st.button("Logout"):
+        st.session_state.clear()
+        st.success("You have been logged out.")
+        st.experimental_rerun()
+
+
 def main():
-    st.title("Real-Time Person Recognition with ResNet18")
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+    if "face_recognized" not in st.session_state:
+        st.session_state["face_recognized"] = False
 
-    # Initialize the database
-    init_db()
+    if not st.session_state["logged_in"]:
+        login_page()
+    elif not st.session_state["face_recognized"]:
+        face_detection_page()
+    else:
+        welcome_page()
 
-    # Sidebar: Load model and dataset information
-    model_path = "person_classifier_resnet18.pth"  # Path to your trained ResNet18 model
-    class_names = os.listdir("Data/train")  # Load class names from dataset
-    num_classes = len(class_names)
-
-    # Load the model
-    model = load_model(model_path, num_classes)
-
-    # Select a mode
-    mode = st.sidebar.selectbox("Select Mode", ["Camera Feed", "Upload Image"])
-
-    # Create two columns: left for the image, right for the prediction
-    col1, col2 = st.columns([2, 1])
-
-    # Initialize the variable for the current prediction
-    if 'current_prediction' not in st.session_state:
-        st.session_state.current_prediction = "No prediction yet"
-
-    if mode == "Camera Feed":
-        with col1:
-            # Start the camera feed
-            st.write("Using camera for real-time person recognition")
-            run = st.checkbox('Run')
-            FRAME_WINDOW = st.image([])
-
-            cap = cv2.VideoCapture(0)
-
-            while run:
-                ret, frame = cap.read()
-                if not ret:
-                    st.write("Unable to read camera feed.")
-                    break
-
-                # Try to classify the person
-                try:
-                    face_tensor = preprocess_image(frame)  # Preprocess the captured frame
-                    predicted_class = classify_image(model, face_tensor, class_names)
-                    # Log the detection into the database
-                    log_detection(predicted_class)
-                    st.session_state.current_prediction = predicted_class
-                except ValueError as e:
-                    st.session_state.current_prediction = str(e)  # Handle no face detected
-
-                # Overlay the current prediction on the frame
-                cv2.putText(frame, f"Prediction: {st.session_state.current_prediction}", (10, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-
-                # Convert BGR to RGB and display the frame with the prediction overlay
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                FRAME_WINDOW.image(frame)
-
-            cap.release()
-
-    elif mode == "Upload Image":
-        with col1:
-            # Upload an image for classification
-            uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
-
-            if uploaded_file is not None:
-                image = Image.open(uploaded_file)
-
-                # Display the uploaded image
-                st.image(image, caption="Uploaded Image", use_column_width=True)
-
-                # Perform classification on the uploaded image
-                try:
-                    face_tensor = preprocess_image(image)  # Preprocess the uploaded image
-                    predicted_class = classify_image(model, face_tensor, class_names)
-                    st.session_state.current_prediction = predicted_class
-                except ValueError as e:
-                    st.session_state.current_prediction = str(e)  # Handle no face detected
-
-                # Display the current prediction in column 2
-                with col2:
-                    st.markdown("### Prediction:")
-                    st.write(st.session_state.current_prediction)
 
 if __name__ == "__main__":
     main()
