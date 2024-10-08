@@ -13,7 +13,43 @@ from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm  
 
 
-USER_CREDENTIALS = {"user1": "password123", "user2": "password456"}
+def init_user_db():
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT
+            )
+        ''')
+        conn.commit()
+
+
+def add_user(username, password):
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        try:
+            c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, password))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+
+
+def fetch_users():
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT * FROM users')
+        users = c.fetchall()
+    return users
+
+
+def is_valid_user(username, password):
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password))
+        user = c.fetchone()
+    return user is not None
+
 
 def load_facenet_model(device):
     model = InceptionResnetV1(pretrained='vggface2').eval()  
@@ -45,33 +81,30 @@ def preprocess_image(image, face_cascade_path='haarcascade_frontalface_default.x
 
 
 def init_embedding_db():
-    conn = sqlite3.connect('embeddings.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS embeddings (
-            person_name TEXT PRIMARY KEY,
-            embedding BLOB
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('embeddings.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS embeddings (
+                person_name TEXT PRIMARY KEY,
+                embedding BLOB
+            )
+        ''')
+        conn.commit()
 
 
 def save_embedding_to_db(person_name, embedding):
-    conn = sqlite3.connect('embeddings.db')
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO embeddings (person_name, embedding) VALUES (?, ?)',
-              (person_name, embedding.tobytes()))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('embeddings.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO embeddings (person_name, embedding) VALUES (?, ?)',
+                  (person_name, embedding.tobytes()))
+        conn.commit()
 
 
 def load_embeddings_from_db():
-    conn = sqlite3.connect('embeddings.db')
-    c = conn.cursor()
-    c.execute('SELECT person_name, embedding FROM embeddings')
-    rows = c.fetchall()
-    conn.close()
+    with sqlite3.connect('embeddings.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT person_name, embedding FROM embeddings')
+        rows = c.fetchall()
 
     known_face_embeddings = []
     class_names = []
@@ -87,13 +120,13 @@ def load_embeddings_from_db():
 
 
 def check_for_new_persons(data_path):
-    conn = sqlite3.connect('embeddings.db')
-    c = conn.cursor()
-    c.execute('SELECT person_name FROM embeddings')
-    existing_persons = set([row[0] for row in c.fetchall()])
+    with sqlite3.connect('embeddings.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT person_name FROM embeddings')
+        existing_persons = set([row[0] for row in c.fetchall()])
+
     data_persons = set(os.listdir(data_path))
     new_persons = data_persons - existing_persons
-    conn.close()
     return list(new_persons)
 
 
@@ -130,26 +163,24 @@ def recognize_face(model, face_tensor, known_face_embeddings, class_names, devic
 
 
 def init_detection_db():
-    conn = sqlite3.connect('detections.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS detections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_name TEXT,
-            datetime TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('detections.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_name TEXT,
+                datetime TEXT
+            )
+        ''')
+        conn.commit()
 
 
 def log_detection(person_name):
-    conn = sqlite3.connect('detections.db')
-    c = conn.cursor()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute('INSERT INTO detections (person_name, datetime) VALUES (?, ?)', (person_name, timestamp))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('detections.db', timeout=10) as conn:
+        c = conn.cursor()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT INTO detections (person_name, datetime) VALUES (?, ?)', (person_name, timestamp))
+        conn.commit()
 
 
 def login_page():
@@ -158,11 +189,11 @@ def login_page():
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
+        if is_valid_user(username, password):
             st.session_state["username"] = username
             st.session_state["logged_in"] = True
             st.success("Login successful! Redirecting to face detection...")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Invalid username or password")
 
@@ -191,7 +222,7 @@ def face_detection_page():
                 log_detection(recognized_person)
                 st.success(f"Face recognized! Redirecting to welcome page...")
                 st.session_state["face_recognized"] = True
-                st.experimental_rerun()
+                st.rerun()
                 break
         except ValueError:
             st.warning("No face detected")
@@ -205,10 +236,23 @@ def welcome_page():
     if st.button("Logout"):
         st.session_state.clear()
         st.success("You have been logged out.")
-        st.experimental_rerun()
+        st.rerun()
 
 
 def main():
+    init_user_db()
+    init_embedding_db()
+    init_detection_db()
+
+    users_to_add = [
+        ("Alahmari", "1234"),
+        ("Alawad", "1234"),
+        ("Alenazi", "1234")
+    ]
+
+    for username, password in users_to_add:
+        add_user(username, password)
+
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
     if "face_recognized" not in st.session_state:
