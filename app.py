@@ -265,6 +265,13 @@ def main():
     else:
         welcome_page()
 
+    # Additional logic for embedding generation and detection
+    data_path = "image_persons"
+    new_persons = check_for_new_persons(data_path)
+    if new_persons:
+        print("Found New Persons. Putting them into db.")
+        model = load_facenet_model(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        generate_and_store_new_embeddings(model, new_persons, data_path, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
 if __name__ == "__main__":
     main()
