@@ -265,7 +265,6 @@ def main():
     else:
         welcome_page()
 
-    # Additional logic for embedding generation and detection
     data_path = "image_persons"
     new_persons = check_for_new_persons(data_path)
     if new_persons:
