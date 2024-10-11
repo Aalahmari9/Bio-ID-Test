@@ -205,6 +205,8 @@ def face_detection_page():
     model = load_facenet_model(device)
     known_face_embeddings, class_names = load_embeddings_from_db()
     cap = cv2.VideoCapture(0)
+    
+    no_face_detected = False  
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -224,15 +226,20 @@ def face_detection_page():
                 st.session_state["face_recognized"] = True
                 st.rerun()
                 break
+            else:
+                no_face_detected = False  
+
         except ValueError:
-            st.warning("No face detected")
+            if not no_face_detected:  
+                st.warning("No face detected")
+                no_face_detected = True  
 
     cap.release()
 
 
 def welcome_page():
-    st.title(f"Welcome {st.session_state['username']}!")
-    
+    st.title(f"Welcome Back {st.session_state['username']}!")
+
     if st.button("Logout"):
         st.session_state.clear()
         st.success("You have been logged out.")
