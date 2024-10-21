@@ -1,0 +1,241 @@
+To add a news API after the user logs in, we can integrate a popular news API like NewsAPI (https://newsapi.org) or any other news provider’s API. For the sake of this demonstration, I’ll assume you have a NewsAPI account and can generate an API key.
+
+Steps to Add News API After Login:
+
+	1.	Sign up for NewsAPI and get your API key.
+	2.	Fetch the news based on the user’s interests or the default top headlines.
+	3.	Display the news on the welcome page after the user logs in.
+
+Here’s how you can integrate it.
+
+Adding the News API:
+
+	1.	Install requests library if not already installed:
+
+pip install requests
+
+
+	2.	Update the code to fetch and display news.
+
+
+Updated Code:
+
+import streamlit as st
+import torch
+from torchvision import transforms
+from PIL import Image
+import cv2
+import sqlite3
+from datetime import datetime
+import numpy as np
+import os
+from facenet_pytorch import InceptionResnetV1  
+from sklearn.metrics.pairwise import cosine_similarity
+import requests
+
+# Your NewsAPI key
+NEWS_API_KEY = 'your_news_api_key'  # Replace with your actual API key from newsapi.org
+
+def init_user_db():
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT
+            )
+        ''')
+        conn.commit()
+
+def add_user(username, password):
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        try:
+            c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, password))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+
+def is_valid_user(username, password):
+    with sqlite3.connect('users.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?', (username, password))
+        user = c.fetchone()
+        if user:
+            st.write(f"User {username} found!")
+        else:
+            st.write(f"User {username} not found or incorrect password!")
+    return user is not None
+
+def load_facenet_model(device):
+    model = InceptionResnetV1(pretrained='vggface2').eval()
+    model.to(device)
+    return model
+
+def preprocess_image(image, face_cascade_path='haarcascade_frontalface_default.xml'):
+    img_rgb = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + face_cascade_path)
+    faces = face_cascade.detectMultiScale(img_rgb, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    if len(faces) == 0:
+        raise ValueError("No face detected in the image.")
+    x, y, w, h = faces[0]
+    face = img_rgb[y:y+h, x:x+w]
+    face_pil = Image.fromarray(face)
+    transform = transforms.Compose([
+        transforms.Resize((160, 160)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    face_tensor = transform(face_pil)
+    face_tensor = face_tensor.unsqueeze(0)
+    return face_tensor
+
+def load_embeddings_from_db():
+    with sqlite3.connect('embeddings.db', timeout=10) as conn:
+        c = conn.cursor()
+        c.execute('SELECT person_name, embedding FROM embeddings')
+        rows = c.fetchall()
+    known_face_embeddings = []
+    class_names = []
+    for row in rows:
+        person_name = row[0]
+        embedding = np.frombuffer(row[1], dtype=np.float32)
+        known_face_embeddings.append(embedding)
+        class_names.append(person_name)
+    return np.array(known_face_embeddings), class_names
+
+def recognize_face(model, face_tensor, known_face_embeddings, class_names, device, threshold=0.6):
+    face_tensor = face_tensor.to(device)
+    with torch.no_grad():
+        embedding = model(face_tensor).cpu().numpy()
+    similarities = cosine_similarity(embedding, known_face_embeddings)
+    best_match_idx = np.argmax(similarities)
+    best_match_score = similarities[0][best_match_idx]
+    if best_match_score >= threshold:
+        return class_names[best_match_idx]
+    else:
+        return "Unknown"
+
+def log_detection(person_name):
+    with sqlite3.connect('detections.db', timeout=10) as conn:
+        c = conn.cursor()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT INTO detections (person_name, datetime) VALUES (?, ?)', (person_name, timestamp))
+        conn.commit()
+
+def fetch_news():
+    url = f'https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}'
+    response = requests.get(url)
+    if response.status_code == 200:
+        news_data = response.json()
+        return news_data['articles'][:5]  # Return the top 5 news articles
+    else:
+        st.error("Failed to fetch news")
+        return []
+
+def display_news():
+    news_articles = fetch_news()
+    st.subheader("Latest News")
+    for article in news_articles:
+        st.write(f"**{article['title']}**")
+        st.write(f"Source: {article['source']['name']}")
+        st.write(f"{article['description']}")
+        st.write(f"[Read more]({article['url']})")
+        st.write("---")
+
+def login_page():
+    st.title("Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if is_valid_user(username, password):
+            st.session_state["username"] = username
+            st.session_state["logged_in"] = True
+            st.success("Login successful! Redirecting to face detection...")
+            st.stop()  # Stop the script to prevent further execution
+        else:
+            st.error("Invalid username or password")
+
+def face_detection_page():
+    st.title("Face Detection")
+    FRAME_WINDOW = st.image([])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_facenet_model(device)
+    known_face_embeddings, class_names = load_embeddings_from_db()
+    cap = cv2.VideoCapture(0)
+
+    if "no_face_detected" not in st.session_state:
+        st.session_state["no_face_detected"] = False
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Failed to read from camera")
+            break
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        FRAME_WINDOW.image(frame)
+
+        try:
+            face_tensor = preprocess_image(frame)
+            recognized_person = recognize_face(model, face_tensor, known_face_embeddings, class_names, device)
+
+            if recognized_person == st.session_state["username"]:
+                log_detection(recognized_person)
+                st.success(f"Face recognized! Redirecting to welcome page...")
+                st.session_state["face_recognized"] = True
+                st.session_state["no_face_detected"] = False
+                st.stop()  # Stop the script to prevent further execution
+                break
+
+        except ValueError:
+            if not st.session_state["no_face_detected"]:
+                st.warning("No face detected")
+                st.session_state["no_face_detected"] = True
+
+    cap.release()
+
+def welcome_page():
+    st.title(f"Welcome Back {st.session_state['username']}!")
+    display_news()
+    if st.button("Logout"):
+        st.session_state.clear()
+        st.success("You have been logged out.")
+        st.stop()  # Stop the script to prevent further execution
+
+def main():
+    init_user_db()
+    users_to_add = [
+        ("Alahmari", "1234"),
+        ("Alawad", "1234"),
+        ("Alenazi", "1234")
+    ]
+    for username, password in users_to_add:
+        add_user(username, password)
+
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+    if "face_recognized" not in st.session_state:
+        st.session_state["face_recognized"] = False
+
+    if not st.session_state["logged_in"]:
+        login_page()
+    elif not st.session_state["face_recognized"]:
+        face_detection_page()
+    else:
+        welcome_page()
+
+if __name__ == "__main__":
+    main()
+
+Explanation:
+
+	1.	NewsAPI Integration: After login and face detection, the fetch_news() function fetches the latest news using the API. The display_news() function displays the news on the welcome page.
+	2.	Top 5 News: The code fetches and displays the top 5 news articles with titles, sources, descriptions, and links to the full article.
+
+Steps:
+
+	1.	Get Your API Key: Sign up at NewsAPI.org to get an API key, and replace your_news_api_key in the code with your actual key.
+	2.	Run the app: After logging in and recognizing the face, the news will be displayed on the welcome page.
+
+Let me know if it works, or if you need further adjustments!
